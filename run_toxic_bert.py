@@ -10,7 +10,9 @@ Created on Thu Oct 29 17:17:43 2020
 import argparse
 
 from bert_toxic import BertForToxic
-from distilbert_toxic import DistilBertForToxic
+#from distilbert_toxic import DistilBertForToxic
+from ganbert_toxic import DistilBertForToxic
+#from large_bert_toxic import DistilBertForToxic
 from data_utils import get_data_loader_bal, get_device, get_data_pred, get_data_loader_pred
 
 import numpy as np
@@ -32,6 +34,8 @@ def train_epoch( model, train_dataloader, dev_dataloader, optimizer, scheduler )
     ## For each batch, we must reset the gradients
     ## stored by the model.   
     train_loss = 0
+    train_loss_y = 0
+    train_loss_z = 0
     count = 0    
     for train_data in tqdm( train_dataloader ):
         
@@ -41,8 +45,8 @@ def train_epoch( model, train_dataloader, dev_dataloader, optimizer, scheduler )
             optimizer.zero_grad()
             # evoke model in training mode on batch
             model.train()
-            prob, loss = model.forward(input_ids=train_data[0],attention_mask=train_data[1],  target = train_data[2],
-                                       sample_weights = train_data[3], mode = 'train')
+            prob, loss, y_loss, z_loss = model.forward(input_ids=train_data[0],attention_mask=train_data[1],  target = train_data[2],
+                                       sample_weights = train_data[3], mode = 'train',  idn_score = train_data[4])
             
             # compute loss w.r.t batch
             
@@ -57,6 +61,8 @@ def train_epoch( model, train_dataloader, dev_dataloader, optimizer, scheduler )
             scheduler.step()
             
             train_loss += loss.item()
+            train_loss_y += y_loss.item()
+            train_loss_z += z_loss.item()
             count = count + 1
             
         except Exception as e :
@@ -67,11 +73,15 @@ def train_epoch( model, train_dataloader, dev_dataloader, optimizer, scheduler )
             
 
     train_loss = train_loss/count
+    train_loss_y = train_loss_y/count
+    train_loss_z = train_loss_z/count
 
     pred_labels = []
     target_labels = []
     probs = []
     dev_loss = 0.0
+    dev_loss_y = 0.0
+    dev_loss_z = 0.0
     thres = 0.5
     count = 0 
     txts = []
@@ -80,11 +90,14 @@ def train_epoch( model, train_dataloader, dev_dataloader, optimizer, scheduler )
 
        with torch.no_grad() :
          
-         prob, loss = model.forward(input_ids=dev_data[0],attention_mask=dev_data[1],  target = dev_data[2],
-                                   sample_weights = dev_data[3], mode='eval')
+         prob, loss, y_loss, z_loss = model.forward(input_ids=dev_data[0],attention_mask=dev_data[1],  target = dev_data[2],
+                                   sample_weights = dev_data[3], mode='eval', idn_score = dev_data[4])
          
          
          dev_loss += loss.item()
+         dev_loss_y += y_loss.item()
+         dev_loss_z += z_loss.item()
+         
          count = count + 1
 
 
@@ -95,9 +108,11 @@ def train_epoch( model, train_dataloader, dev_dataloader, optimizer, scheduler )
          target = dev_data[2].cpu().detach().numpy() 
          
          target_labels.append(target)
-         txts.append(dev_data[4])
+         txts.append(dev_data[-2])
 
     dev_loss = dev_loss / count 
+    dev_loss_y = dev_loss_y / count 
+    dev_loss_z = dev_loss_z / count 
     
     target_labels = np.concatenate(target_labels)
     pred_labels = np.concatenate(pred_labels)
@@ -108,6 +123,9 @@ def train_epoch( model, train_dataloader, dev_dataloader, optimizer, scheduler )
     dev_pred['pred'] = pred_labels
     dev_pred['target'] = target_labels
     
+    target_labels[target_labels<thres] = 0
+    target_labels[target_labels>=thres] = 1
+    
     
     accuracy = accuracy_score(target_labels, pred_labels, )
     f1 = f1_score(target_labels, pred_labels, )
@@ -115,7 +133,8 @@ def train_epoch( model, train_dataloader, dev_dataloader, optimizer, scheduler )
     precision = precision_score(target_labels, pred_labels, )
     recall = recall_score(target_labels, pred_labels, )
     
-    stats = {'accuracy': accuracy, 'precision':precision, 'recall':recall, 'f1':f1, 'dev_loss':dev_loss, 'train_loss':train_loss }
+    stats = {'accuracy': accuracy, 'precision':precision, 'recall':recall, 'f1':f1, 'dev_loss':dev_loss, 'train_loss':train_loss,  
+             'dev_loss_y':dev_loss_y, 'train_loss_y':train_loss_y, 'dev_loss_z':dev_loss_z, 'train_loss_z':train_loss_z,}
     
     
 
@@ -127,7 +146,7 @@ def train_epoch( model, train_dataloader, dev_dataloader, optimizer, scheduler )
 
 def run_model(pos_train_file , neg_train_file, pos_dev_file , neg_dev_file , nrows_train, 
               nrows_dev, epochs , out_dir, dropout = 0.2, model = 'bert', batch_size = 16, 
-              test_file = '../data/test_data_clean.csv', lr = 2e-5) :
+              test_file = '../data/test_data_clean.csv', lr = 2e-5, lmda = 10.0, stnc_emb = 'last') :
     
     
     
@@ -140,14 +159,17 @@ def run_model(pos_train_file , neg_train_file, pos_dev_file , neg_dev_file , nro
     if model == 'bert' :
        config = BertConfig()
        config.output_hidden_states = True
-       model = BertForToxic(config,  bert_hidden_states=bert_hidden_states, dropout = dropout, update_bert = True)       
+       model = BertForToxic(config,  bert_hidden_states=bert_hidden_states, dropout = dropout, update_bert = True, )       
        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
     
     if model == 'distilbert' :
-        config = DistilBertConfig()
+        #config = DistilBertConfig()
+        config = BertConfig()
         config.output_hidden_states = True
-        model = DistilBertForToxic(config,  bert_hidden_states=bert_hidden_states, dropout = dropout, update_bert = True)
-        tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased', do_lower_case=True)
+        model = DistilBertForToxic(config,  bert_hidden_states=bert_hidden_states, dropout = dropout, 
+                                   update_bert = True, lmda= lmda,stnc_emb= stnc_emb)
+        #tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased', do_lower_case=True)
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
 
     train_dataloader = get_data_loader_bal(pos_train_file, neg_train_file, batch_size=batch_size, nrows_pos= nrows_train, nrows_neg = nrows_train*10, mode = 'train', tokenizer=tokenizer)
     dev_dataloader =   get_data_loader_bal(pos_dev_file, neg_dev_file, batch_size=batch_size, nrows_pos= nrows_dev, nrows_neg = nrows_dev, mode = 'dev', tokenizer=tokenizer)
